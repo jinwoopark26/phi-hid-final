@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect } from "react";
 
 const T = {
   bg: "#FAF9F6", surface: "#FFFFFF", sidebar: "#F4F2EC",
@@ -14,16 +14,18 @@ const T = {
 };
 
 type Edit = { id: number; start: number; end: number; prevText: string };
+type Convo = { id: number; prompt: string; text: string; edits: Edit[] };
 
 export default function Page() {
   const [stage, setStage] = useState<"ask" | "generating" | "ready">("ask");
   const [request, setRequest] = useState("");
   const [userMsg, setUserMsg] = useState("");
-  const [history, setHistory] = useState<string[]>([]);
+  const [convos, setConvos] = useState<Convo[]>([]);      // 저장된 대화들
+  const [activeId, setActiveId] = useState<number | null>(null);
 
   const [text, setText] = useState("");
-  const [typed, setTyped] = useState(0);           // typewriter 진행
-  const [fullDraft, setFullDraft] = useState("");   // 생성된 전체(타이핑 대상)
+  const [typed, setTyped] = useState(0);
+  const [fullDraft, setFullDraft] = useState("");
   const [edits, setEdits] = useState<Edit[]>([]);
   const [selection, setSelection] = useState<{ start: number; end: number; text: string } | null>(null);
   const [intent, setIntent] = useState("");
@@ -37,7 +39,7 @@ export default function Page() {
   useEffect(() => { if (stage === "ask" && askRef.current) askRef.current.focus(); }, [stage]);
   useEffect(() => { if (selection && intentRef.current) intentRef.current.focus(); }, [selection]);
 
-  // typewriter 진행
+  // typewriter
   useEffect(() => {
     if (stage !== "generating" || !fullDraft) return;
     if (typed >= fullDraft.length) {
@@ -48,15 +50,25 @@ export default function Page() {
     return () => clearTimeout(id);
   }, [stage, fullDraft, typed]);
 
+  // 현재 대화 상태를 convos에 저장(활성 대화 갱신)
+  useEffect(() => {
+    if (activeId == null || stage !== "ready") return;
+    setConvos((prev) => prev.map((c) => c.id === activeId ? { ...c, text, edits } : c));
+  }, [text, edits, activeId, stage]);
+
   async function submitRequest() {
     const q = request.trim();
     if (!q) return;
+    const id = Date.now();
     setUserMsg(q);
-    setHistory((h) => [q, ...h]);
+    setActiveId(id);
+    setConvos((prev) => [{ id, prompt: q, text: "", edits: [] }, ...prev]);
     setRequest("");
     setError("");
     setTyped(0);
     setFullDraft("");
+    setEdits([]);
+    setSelection(null);
     setStage("generating");
     try {
       const res = await fetch("/api/generate", {
@@ -65,12 +77,27 @@ export default function Page() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "생성 실패");
-      setFullDraft(data.text); // typewriter가 이걸 타이핑
+      setFullDraft(data.text);
+      setConvos((prev) => prev.map((c) => c.id === id ? { ...c, text: data.text } : c));
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "오류가 발생했습니다");
       setStage("ready");
       setText("");
     }
+  }
+
+  // 최근 대화 클릭 → 복원
+  function openConvo(c: Convo) {
+    setActiveId(c.id);
+    setUserMsg(c.prompt);
+    setText(c.text);
+    setEdits(c.edits);
+    setFullDraft(c.text);
+    setTyped(c.text.length);
+    setSelection(null);
+    setIntent("");
+    setError("");
+    setStage("ready");
   }
 
   function handleMouseUp() {
@@ -118,15 +145,18 @@ export default function Page() {
     setEdits((e) => e.slice(0, -1));
   }
 
+  // 새 대화 → 완전히 첫 화면으로
   function newChat() {
-    setStage("ask"); setUserMsg(""); setText(""); setFullDraft(""); setTyped(0);
+    setStage("ask");
+    setActiveId(null);
+    setUserMsg(""); setText(""); setFullDraft(""); setTyped(0);
     setEdits([]); setSelection(null); setIntent(""); setError(""); setRequest("");
   }
 
   function renderBody() {
-    if (edits.length === 0) return text;
-    const sorted = [...edits].sort((a, b) => a.start - b.start);
+    // 편집 중인 구간은 로딩 표시
     const parts: React.ReactNode[] = [];
+    const sorted = [...edits].sort((a, b) => a.start - b.start);
     let cursor = 0;
     sorted.forEach((e, idx) => {
       if (e.start > cursor) parts.push(<span key={`p${idx}`}>{text.slice(cursor, e.start)}</span>);
@@ -138,10 +168,25 @@ export default function Page() {
       cursor = e.end;
     });
     if (cursor < text.length) parts.push(<span key="tail">{text.slice(cursor)}</span>);
-    return parts;
+
+    // 수정 중이면 선택 구간을 로딩 표시로 덮어쓰기
+    if (editing && selection) {
+      const before = text.slice(0, selection.start);
+      const after = text.slice(selection.end);
+      return (
+        <>
+          <span>{before}</span>
+          <span style={{ background: T.sel, borderRadius: 4, padding: "1px 6px", display: "inline-flex", alignItems: "center", gap: 4, verticalAlign: "middle" }}>
+            <span style={dot(0)} /><span style={dot(160)} /><span style={dot(320)} />
+          </span>
+          <span>{after}</span>
+        </>
+      );
+    }
+    return edits.length === 0 ? text : parts;
   }
 
-  if (stage === "ask" && history.length === 0) {
+  if (stage === "ask") {
     return (
       <div style={sx.askWrap}>
         <style>{css}</style>
@@ -169,8 +214,11 @@ export default function Page() {
       <aside style={sx.sidebar}>
         <button onClick={newChat} style={sx.newChatBtn}><span style={{ fontSize: 15 }}>＋</span> 새 대화</button>
         <div style={sx.recentLabel}>최근</div>
-        {history.map((t, i) => (
-          <button key={i} style={{ ...sx.recentItem, ...(i === 0 ? sx.recentActive : {}) }}>{t}</button>
+        {convos.map((c) => (
+          <button key={c.id} onClick={() => openConvo(c)}
+            style={{ ...sx.recentItem, ...(c.id === activeId ? sx.recentActive : {}) }}>
+            {c.prompt}
+          </button>
         ))}
       </aside>
 
@@ -216,13 +264,15 @@ export default function Page() {
                 <div style={{ display: "flex", gap: T.s2 }}>
                   <input ref={intentRef} value={intent} onChange={(e) => setIntent(e.target.value)}
                     onKeyDown={(e) => { if (e.key === "Enter") runEdit(); }}
-                    placeholder="이 부분을 어떻게 바꿀까요? (예: 더 부드럽게)" style={sx.textInput} />
+                    placeholder="이 부분을 어떻게 바꿀까요? (예: 더 부드럽게)" style={sx.textInput} disabled={editing} />
                   <button onClick={runEdit} disabled={editing} style={editing ? sx.primaryBtnOff : sx.primaryBtn}>
                     {editing ? "고치는 중…" : "이 부분만 수정"}
                   </button>
                 </div>
-                <button onClick={() => { setSelection(null); const s = window.getSelection(); if (s) s.removeAllRanges(); }}
-                  style={sx.cancelLink}>선택 취소</button>
+                {!editing && (
+                  <button onClick={() => { setSelection(null); const s = window.getSelection(); if (s) s.removeAllRanges(); }}
+                    style={sx.cancelLink}>선택 취소</button>
+                )}
               </>
             ) : (
               <div style={{ display: "flex", gap: T.s2 }}>
@@ -247,8 +297,16 @@ export default function Page() {
 }
 
 function trunc(s: string, n: number) { return s.length > n ? s.slice(0, n) + "…" : s; }
+function dot(delay: number): React.CSSProperties {
+  return { width: 6, height: 6, borderRadius: "50%", background: T.blue, display: "inline-block",
+    animation: `leb 1.2s ${delay}ms infinite ease-in-out both` };
+}
 
-const css = `@keyframes leBlink{50%{opacity:0}} ::selection{background:${T.sel}}`;
+const css = `
+  @keyframes leBlink{50%{opacity:0}}
+  @keyframes leb{0%,80%,100%{transform:scale(0.5);opacity:0.4}40%{transform:scale(1);opacity:1}}
+  ::selection{background:${T.sel}}
+`;
 
 const sx: Record<string, React.CSSProperties> = {
   askWrap: { minHeight: "100vh", background: T.bg, color: T.ink, fontFamily: T.font, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "40px 20px", boxSizing: "border-box" },
